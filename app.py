@@ -9,16 +9,31 @@ Then open http://127.0.0.1:8000
 
 Deploy: shinyapps.io (rsconnect deploy shiny .), Posit Connect, or any server running `shiny run`.
 Saved responses go to responses.csv next to this file (used by the Group dashboard tab).
+
+Emailing results: set these environment variables before starting the app to enable the
+"Email my results" button on the Results page (it is hidden otherwise):
+    SMTP_HOST       e.g. smtp.gmail.com
+    SMTP_PORT       default 587 (STARTTLS); use 465 for implicit SSL
+    SMTP_USER       login user (optional if the server does not need auth)
+    SMTP_PASSWORD   login password / app password
+    SMTP_FROM       sender address (defaults to SMTP_USER)
+    SMTP_BCC        optional address(es), comma separated, that get a copy (e.g. the facilitator)
+    SMTP_STARTTLS   set to 0 to skip STARTTLS on a non-465 port (local test servers only)
 Free text ("Other" answers and the open box) is analysed by text_analysis.py, which must sit in the same folder.
 """
 
 from __future__ import annotations
 
+import asyncio
 import html
 import io
 import random
 import os
+import re
+import smtplib
+import ssl
 from datetime import datetime
+from email.message import EmailMessage
 
 import matplotlib
 
@@ -138,6 +153,49 @@ EXAMPLE = {"A": [4, 4, 3, 4, 3, 4, 4, 3], "B": [3, 4, 4, 3, 3, 4, 4, 2],
            "C": [2, 2, 3, 3, 4, 2, 2, 3], "D": [3, 2, 3, 3, 2, 4, 3, 2]}
 
 RESPONSES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "responses.csv")
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+# ---------------------------------------------------------------------------
+# Email (SMTP settings come from environment variables, see module docstring)
+# ---------------------------------------------------------------------------
+def smtp_configured() -> bool:
+    return bool(os.environ.get("SMTP_HOST") and (os.environ.get("SMTP_FROM") or os.environ.get("SMTP_USER")))
+
+
+def send_results_email(to: str, name: str, body: str, chart_png: bytes | None, filename: str) -> None:
+    """Send the plain-text results summary, with the summary and chart attached. Raises on failure."""
+    host = os.environ["SMTP_HOST"]
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ.get("SMTP_USER", "")
+    sender = os.environ.get("SMTP_FROM") or user
+    bcc = [a.strip() for a in os.environ.get("SMTP_BCC", "").split(",") if a.strip()]
+
+    msg = EmailMessage()
+    msg["Subject"] = "Your Behavioural Blueprint Assessment results"
+    msg["From"] = sender
+    msg["To"] = to
+    greeting = f"Hello {name},\n\n" if name else "Hello,\n\n"
+    msg.set_content(greeting + "Thank you for completing the Behavioural Blueprint Assessment. "
+                    "Your results are below and attached.\n\n" + body
+                    + "\n\nThis is a self-reflection and conversation-starting tool, "
+                      "not a clinical or diagnostic instrument.\n")
+    msg.add_attachment(body.encode("utf-8"), maintype="text", subtype="plain", filename=filename)
+    if chart_png:
+        msg.add_attachment(chart_png, maintype="image", subtype="png", filename="section_totals.png")
+
+    ctx = ssl.create_default_context()
+    if port == 465:
+        server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+    else:
+        server = smtplib.SMTP(host, port, timeout=30)
+    with server:
+        if port != 465 and os.environ.get("SMTP_STARTTLS", "1") != "0":
+            server.starttls(context=ctx)
+        if user:
+            server.login(user, os.environ.get("SMTP_PASSWORD", ""))
+        server.send_message(msg, to_addrs=[to, *bcc])
 
 
 # ---------------------------------------------------------------------------
@@ -884,6 +942,7 @@ def server(input, output, session):
                 ui.download_button("download", "Download results (.txt)", class_="btn-outline-secondary"),
                 style="margin:18px 0",
             ),
+            email_block(),
             ui.div(ui.h4("Before you go"), *[ui.p(p) for p in CLOSING], class_="closing",
                    style=f"border-top:1px solid {LINE};padding-top:14px"),
             style="max-width:900px",
@@ -963,6 +1022,58 @@ def server(input, output, session):
         r = result()
         req(r)
         yield summary_text(r)
+
+    # ---- email ----
+    def email_block():
+        if not smtp_configured():
+            return None
+        return ui.div(
+            ui.h4("Email my results"),
+            ui.p("Get a copy of this report (summary and chart) in your inbox.", class_="muted"),
+            ui.div(
+                ui.input_text("email", None, placeholder="you@example.com", width="320px"),
+                ui.input_task_button("send_email", "Email my results", label_busy="Sending...",
+                                     class_="btn-outline-primary"),
+                style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap",
+            ),
+            style="margin:0 0 18px",
+        )
+
+    @reactive.extended_task
+    async def email_task(to, name, body, png, filename):
+        await asyncio.to_thread(send_results_email, to, name, body, png, filename)
+        return to
+
+    @reactive.effect
+    @reactive.event(input.send_email)
+    def _send_email():
+        r = result()
+        if r is None:
+            ui.notification_show("Answer all statements before emailing your results.", type="warning")
+            return
+        to = (input.email() or "").strip()
+        if not EMAIL_RE.match(to):
+            ui.notification_show("Please enter a valid email address.", type="warning")
+            return
+        fig = plot_totals(r["totals"], "Section totals")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        plt.close(fig)
+        email_task(to, (input.name() or "").strip(), summary_text(r), buf.getvalue(),
+                   f"blueprint_results_{datetime.now():%Y%m%d_%H%M}.txt")
+
+    @reactive.effect
+    def _email_done():
+        status = email_task.status()
+        if status == "success":
+            ui.notification_show(f"Results sent to {email_task.result()}.", type="message")
+        elif status == "error":
+            try:
+                email_task.result()
+            except Exception as e:  # noqa: BLE001
+                print(f"Email failed: {e!r}", flush=True)
+            ui.notification_show("Sorry, the email could not be sent. Please download your results instead.",
+                                 type="error", duration=8)
 
     @reactive.effect
     @reactive.event(input.save)
