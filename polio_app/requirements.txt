@@ -1,0 +1,6 @@
+shiny>=1.0
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+# PNG download (after installing, run once: playwright install chromium)
+playwright>=1.40
